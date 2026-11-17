@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
+from stratakb.core.migrations import MigrationError
 from stratakb.learning.pii import scrub_query
 from stratakb.rag.clause_lookup import (
     ClauseMatches,
@@ -56,7 +57,7 @@ from stratakb.rag.passages import (
     sources_from,
 )
 from stratakb.rag.receipts import issue_receipt
-from stratakb.rag.reranker import reranker_profile
+from stratakb.rag.reranker import ranking_settings, reranker_profile
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
@@ -66,6 +67,10 @@ logger = structlog.get_logger()
 
 # search_chunks returns at most this many results, so no rerank pool is larger
 _MAX_RERANK_POOL = 50
+
+# A grounded answer's note when the cited documents could not be read because
+# the schema is behind; the MigrationError's text follows with the fix
+SCHEMA_BEHIND_NOTE = "Passages are cited by file name only: the database schema is out of date."
 
 
 async def _detect_layers(database_url: str, query: str, learning_enabled: bool) -> list[str]:
@@ -257,14 +262,17 @@ async def _cited_documents(
 ) -> dict[int, dict[str, Any]]:
     """The stored documents the chunks cite, read in one query.
 
-    A chunk without offsets cites no document. When the read fails, the
-    passages are cited by file name only.
+    A chunk without offsets cites no document. A schema that cannot be brought
+    up to date raises its MigrationError, so the caller can say why; when the
+    read fails any other way, the passages are cited by file name only.
     """
     ends = _cited_ends(chunks)
     if not ends:
         return {}
     try:
         return await _read_cited_documents(database_url, ends)
+    except MigrationError:
+        raise
     except Exception as e:
         logger.warning("cited_documents_fetch_failed", error_type=type(e).__name__)
         return {}
@@ -622,14 +630,9 @@ def register_rag_tools(
 
             # The reranker's candidate pool: the model's own multiple of top_k
             # unless the setting overrides it, never more than a search returns
+            rerank_thresholds, multiplier = ranking_settings(_settings)
             pool = top_k
-            rerank_thresholds = None
-            if _settings.reranking_enabled:
-                profile = reranker_profile(_settings.reranking_model)
-                rerank_thresholds = profile.thresholds
-                multiplier = (
-                    _settings.reranking_candidate_multiplier or profile.pool_multiplier
-                )
+            if multiplier is not None:
                 pool = min(top_k * multiplier, _MAX_RERANK_POOL)
 
             async def _collect(
@@ -687,7 +690,14 @@ def register_rag_tools(
             candidates = exact + without_exact_spans(collected.chunks, exact)
             # Read for every chunk that could fit and every named clause past them
             window = reading_window(candidates, budget)
-            documents = await _cited_documents(database_url, window + exact[len(window):])
+            schema_error: MigrationError | None = None
+            try:
+                documents = await _cited_documents(database_url, window + exact[len(window):])
+            except MigrationError as e:
+                # Cited by file name; extractive fails with this error, grounded notes it
+                logger.warning("cited_documents_schema_out_of_date", error=str(e))
+                documents = {}
+                schema_error = e
             # The best chunks whose passages, as the client gets them (replaced_by
             # labels too), fit the answer budget; confidence is judged on the
             # reranked chunks, the answer status on what is returned
@@ -715,6 +725,9 @@ def register_rag_tools(
             extraction = None
             note = None
             if used_mode == "extractive":
+                if schema_error is not None:
+                    # Checked once per ask: a second check would replay the failure
+                    raise schema_error
                 extraction = await _extract_answer(
                     database_url,
                     question,
@@ -739,7 +752,10 @@ def register_rag_tools(
                 names_note = missing_names_note(
                     check, related=bool(passages) and status == "not_found"
                 )
-                note = _join_notes(names_note, clause_note)
+                schema_note = (
+                    f"{SCHEMA_BEHIND_NOTE} {schema_error}" if schema_error is not None else None
+                )
+                note = _join_notes(names_note, clause_note, schema_note)
 
             # Audit
             await write_audit_log(
