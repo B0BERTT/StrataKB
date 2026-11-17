@@ -24,7 +24,6 @@ from stratakb.rag.clause_lookup import (
 )
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
 from stratakb.rag.confidence import (
-    EXTRACTIVE_SENTENCE_THRESHOLD,
     Confidence,
     answer_status,
     score_confidence,
@@ -50,19 +49,23 @@ from stratakb.rag.passages import (
     ToolFailure,
     ask_chunk,
     basis_score,
-    build_passages,
     cut_clause_note,
     left_out_note,
     pack_passages,
+    reading_window,
     sources_from,
 )
 from stratakb.rag.receipts import issue_receipt
+from stratakb.rag.reranker import reranker_profile
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
     from stratakb.rag.retriever import SearchResult
 
 logger = structlog.get_logger()
+
+# search_chunks returns at most this many results, so no rerank pool is larger
+_MAX_RERANK_POOL = 50
 
 
 async def _detect_layers(database_url: str, query: str, learning_enabled: bool) -> list[str]:
@@ -298,13 +301,14 @@ async def _extract_answer(
     the answer is not_found, before any receipt; when some are missing, a found
     answer becomes partly_found. The note names the missing ones.
     """
+    thresholds = reranker_profile(model_name).thresholds
     ends = _cited_ends(chunks, SENTENCE_REACH)
     documents = await _read_cited_documents(database_url, ends) if ends else {}
     # Splitting and scoring are CPU-bound: kept off the event loop
     candidates = await asyncio.to_thread(candidate_sentences, chunks, documents, ends)
     try:
         sentences = await asyncio.to_thread(
-            select_sentences, question, candidates, EXTRACTIVE_SENTENCE_THRESHOLD, model_name
+            select_sentences, question, candidates, thresholds.medium_score, model_name
         )
     except Exception as e:
         logger.warning("extractive_scoring_failed", error_type=type(e).__name__)
@@ -343,7 +347,7 @@ async def _extract_answer(
         ],
         tool_name="strata_ask",
     )
-    status = answer_status(max(s.score for s in sentences), "rerank")
+    status = answer_status(max(s.score for s in sentences), "rerank", thresholds)
     gap_note = await asyncio.to_thread(clause_gap_note, chunks, documents, ends, sentences)
     if (names_note or gap_note or omitted_note) and status == "found":
         status = "partly_found"
@@ -616,23 +620,31 @@ def register_rag_tools(
                 settings=_settings,
             )
 
+            # The reranker's candidate pool: the model's own multiple of top_k
+            # unless the setting overrides it, never more than a search returns
+            pool = top_k
+            rerank_thresholds = None
+            if _settings.reranking_enabled:
+                profile = reranker_profile(_settings.reranking_model)
+                rerank_thresholds = profile.thresholds
+                multiplier = (
+                    _settings.reranking_candidate_multiplier or profile.pool_multiplier
+                )
+                pool = min(top_k * multiplier, _MAX_RERANK_POOL)
+
             async def _collect(
                 search_layers: list[str] | None,
             ) -> _Collected:
                 async def _run_search(q: str) -> list[SearchResult]:
                     return await search_chunks(
                         database_url, openai_api_key, q,
-                        layers=search_layers, top_k=top_k, settings=_settings,
+                        layers=search_layers, top_k=pool, settings=_settings,
                     )
 
                 batch_results = await asyncio.gather(*(_run_search(q) for q in queries))
                 fused = _fuse_query_results(list(batch_results), _settings.hybrid_rrf_k)
 
-                rerank_limit = (
-                    top_k * _settings.reranking_candidate_multiplier
-                    if _settings.reranking_enabled else top_k
-                )
-                candidates = [_ask_chunk(r, s) for r, s in fused[:rerank_limit]]
+                candidates = [_ask_chunk(r, s) for r, s in fused[:pool]]
                 if _settings.reranking_enabled and candidates:
                     from stratakb.rag.reranker import rerank_results
 
@@ -642,13 +654,17 @@ def register_rag_tools(
                     )
                     # The reranker's relevance probabilities (0-1)
                     basis = "rerank"
+                    thresholds = rerank_thresholds
                 else:
                     # Cosine similarity, never a fused score: that one is
                     # normalized so the top result is always 1.0
                     chunks = candidates
                     basis = "similarity"
+                    thresholds = None
                 confidence = score_confidence(
-                    [basis_score(c, basis) for c in chunks], basis=basis
+                    [basis_score(c, basis) for c in chunks],
+                    basis=basis,
+                    thresholds=thresholds,
                 )
                 return _Collected(len(candidates), chunks, confidence)
 
@@ -667,29 +683,26 @@ def register_rag_tools(
                 database_url, question, layers, _settings.answer_token_budget
             )
             exact = matches.chunks
-            # The best chunks that fit the answer budget; confidence is judged
-            # on the reranked chunks, the answer status on what is returned
-            chunks = pack_passages(
-                exact + without_exact_spans(collected.chunks, exact),
-                _settings.answer_token_budget,
-            )
+            budget = _settings.answer_token_budget
+            candidates = exact + without_exact_spans(collected.chunks, exact)
+            # Read for every chunk that could fit and every named clause past them
+            window = reading_window(candidates, budget)
+            documents = await _cited_documents(database_url, window + exact[len(window):])
+            # The best chunks whose passages, as the client gets them (replaced_by
+            # labels too), fit the answer budget; confidence is judged on the
+            # reranked chunks, the answer status on what is returned
+            chunks, passages = pack_passages(candidates, budget, documents)
             confidence = collected.confidence
             basis = confidence.basis
-            # Read for every chunk packed and every named clause past them
-            documents = await _cited_documents(database_url, chunks + exact[len(chunks):])
-            # The citations are known now, replaced_by labels too: the passages as
-            # the client gets them must fit, so the last that no longer fit are dropped
-            chunks = pack_passages(
-                chunks, _settings.answer_token_budget, documents=documents
-            )
             # Packing keeps a prefix, so the named clauses past it did not fit
             left_out = exact[len(chunks):]
-            passages = build_passages(chunks, documents)
             omitted = _join_notes(
                 left_out_note(left_out, documents), cap_note(matches, layer_named)
             )
             status = answer_status(
-                max((basis_score(c, basis) for c in chunks), default=0.0), basis
+                max((basis_score(c, basis) for c in chunks), default=0.0),
+                basis,
+                rerank_thresholds if basis == "rerank" else None,
             )
             sources = sources_from(chunks, basis) if include_sources else None
             # The names the question asks about must be in what goes back; a
@@ -794,9 +807,10 @@ def register_rag_tools(
         clauses left out and their files, and counting the sections not read.
         References past the first 10 are not looked up; the note names them.
         A name the question asks about (asyncio.TaskPool, PyConfig_Merge,
-        AC04, PEP 8) must be in a passage returned: when none is, the status
-        is not_found and the passages are only related text; when some are
-        missing, a found answer becomes partly_found. The note names them.
+        PYTHONHASHSEED, $PGHOST, AC04, PEP 8) must be in a passage returned:
+        when none is, the status is not_found and the passages are only
+        related text; when some are missing, a found answer becomes
+        partly_found. The note names them.
 
         The response: status is found, partly_found or not_found, with a
         next_step for the last two; mode is the mode used; passages lists S1,
